@@ -3,9 +3,18 @@
 // Licensed under the MIT License.
 // ------------------------------------------------------------------------------
 
-import { TurnContext, Authorization } from '@microsoft/agents-hosting';
-import { logger, formatError, ObservabilityConfiguration, defaultObservabilityConfigurationProvider } from '@microsoft/agents-a365-observability';
-import { IConfigurationProvider } from '@microsoft/agents-a365-runtime';
+import {
+    logger, formatError, defaultObservabilityConfigurationProvider,
+    type ObservabilityConfiguration, type TokenResolver,
+} from '@microsoft/agents-a365-observability';
+import type { IConfigurationProvider } from '@microsoft/agents-a365-runtime';
+
+/** Acquires an app-only OBS token; must not perform user_fic or OBO authentication. */
+export type ObservabilityTokenResolver = (
+    agentId: string,
+    tenantId: string,
+    scopes: readonly string[]
+) => ReturnType<TokenResolver>;
 
 interface CacheEntry {
     scopes: string[];
@@ -32,6 +41,7 @@ export class AgenticTokenCache {
     private readonly _maxCacheSize = 10_000;
     private readonly _maxExpSeconds = 86_400; // 24 hours
     private readonly _keyLocks = new Map<string, Promise<unknown>>();
+    private _removedOverloadLogged = false;
     private readonly _configProvider: IConfigurationProvider<ObservabilityConfiguration>;
 
     /**
@@ -64,28 +74,35 @@ export class AgenticTokenCache {
         return entry.token;
     }
 
+    /**
+     * Refreshes an app-only OBS token independently of the current user's authorization.
+     * The resolver receives the configured OBS scopes and must acquire a token for
+     * the exporting agent identity, not its blueprint or the workload's user.
+     *
+     * @throws When the resolver fails or returns no token. Call this from the exporter's
+     * `tokenResolver`, where a failure fails that export, or wrap it in try/catch on the
+     * request path.
+     */
     public async RefreshObservabilityToken(
         agentId: string,
         tenantId: string,
-        turnContext: TurnContext,
-        authorization: Authorization,
-        scopes: string[],
-        authHandlerName: string = 'agentic'
+        tokenResolver: ObservabilityTokenResolver
     ): Promise<void> {
+        if (typeof tokenResolver !== 'function') {
+            // Untyped callers can still pass the TurnContext/Authorization overload removed in 2.0.0.
+            this.logRemovedOverloadOnce();
+            return;
+        }
+        if (!agentId?.trim() || !tenantId?.trim()) {
+            throw new Error('[AgenticTokenCache] Agent and tenant IDs are required');
+        }
         const key = AgenticTokenCache.makeKey(agentId, tenantId);
-        if (!authorization) {
-            throw new Error('[AgenticTokenCache] Authorization not set');
-        }
-        if (!turnContext) {
-            throw new Error('[AgenticTokenCache] TurnContext not set');
-        }
         return this.withKeyLock<void>(key, async () => {
             let entry = this._map.get(key);
             if (!entry) {
-                const effectiveScopes = (scopes && scopes.length > 0) ? scopes : [...this._configProvider.getConfiguration().observabilityAuthenticationScopes];
+                const effectiveScopes = [...this._configProvider.getConfiguration().observabilityAuthenticationScopes];
                 if (!Array.isArray(effectiveScopes) || effectiveScopes.length === 0) {
-                    logger.error('[AgenticTokenCache] No valid scopes');
-                    return;
+                    throw new Error('[AgenticTokenCache] No valid scopes');
                 }
                 entry = { scopes: effectiveScopes };
                 if (this._map.size >= this._maxCacheSize) {
@@ -97,8 +114,7 @@ export class AgenticTokenCache {
                 this._map.set(key, entry);
             }
             if (!Array.isArray(entry.scopes) || entry.scopes.length === 0) {
-                logger.error('[AgenticTokenCache] Entry has invalid scopes');
-                return;
+                throw new Error('[AgenticTokenCache] Entry has invalid scopes');
             }
 
             if (entry.token && !this.isExpired(entry)) {
@@ -107,21 +123,19 @@ export class AgenticTokenCache {
 
             const maxRetries = 2;
             for (let attempt = 0; attempt <= maxRetries; attempt++) {
-                logger.info(`[AgenticTokenCache] Exchanging token attempt ${attempt + 1}/${maxRetries + 1}`);
+                logger.info(`[AgenticTokenCache] Acquiring app-only token attempt ${attempt + 1}/${maxRetries + 1}`);
                 try {
-                    const tokenResponse = await authorization.exchangeToken(turnContext, authHandlerName, { scopes: entry.scopes });
-                    if (!tokenResponse?.token) {
-                        logger.error('[AgenticTokenCache] Undefined token returned');
-                        entry.token = undefined;
-                        entry.expiresOn = undefined;
-                        break;
+                    const token = await tokenResolver(agentId, tenantId, [...entry.scopes]);
+                    if (!token?.trim()) {
+                        throw new Error('[AgenticTokenCache] App-only token resolver returned no token');
                     }
-                    entry.token = tokenResponse.token;
+                    entry.token = token;
                     entry.acquiredOn = Date.now();
-                    const oboExp = this.decodeExp(entry.token);
-                    if (oboExp) {
-                        entry.expiresOn = oboExp * 1000;
+                    const exp = this.decodeExp(token);
+                    if (exp) {
+                        entry.expiresOn = exp * 1000;
                     } else {
+                        entry.expiresOn = undefined;
                         logger.warn('[AgenticTokenCache] No exp claim, fallback TTL');
                     }
                     logger.info('[AgenticTokenCache] Token cached');
@@ -136,7 +150,8 @@ export class AgenticTokenCache {
                     logger.error('[AgenticTokenCache] Non-retriable failure', formatError(e));
                     entry.token = undefined;
                     entry.expiresOn = undefined;
-                    break;
+                    entry.acquiredOn = undefined;
+                    throw e;
                 }
             }
         });
@@ -203,6 +218,14 @@ export class AgenticTokenCache {
             }
         }
         return false;
+    }
+
+    private logRemovedOverloadOnce(): void {
+        if (this._removedOverloadLogged) {
+            return;
+        }
+        this._removedOverloadLogged = true;
+        logger.error('[AgenticTokenCache] RefreshObservabilityToken(agentId, tenantId, turnContext, authorization, ...) was removed in 2.0.0 and does nothing; S2S OBS needs an app-only token. Call RefreshObservabilityToken(agentId, tenantId, tokenResolver) instead.');
     }
 
     private sleep(ms: number): Promise<void> {
